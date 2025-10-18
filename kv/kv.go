@@ -4,8 +4,14 @@ import (
 	"context"
 	"errors"
 	"sync"
-	"time"
 )
+
+type Timestamp = int
+
+type Version struct {
+	TS    Timestamp
+	Value string
+}
 
 type Entry struct {
 	Key   string
@@ -18,16 +24,70 @@ type Store struct {
 	commitIndex int
 	state       map[string]string
 
-	readCond *sync.Cond
+	readCond  *sync.Cond
+	appliedCh chan struct{}
+	versions  map[string][]Version
+}
+
+type Txn struct {
+	s       *Store
+	startTS Timestamp
+	writes  map[string]string
+}
+
+func (s *Store) Begin() *Txn {
+	s.mu.Lock()
+	start := s.commitIndex
+	s.mu.Unlock()
+
+	return &Txn{
+		s:       s,
+		startTS: start,
+		writes:  make(map[string]string),
+	}
+}
+
+func (tx *Txn) Put(key, val string) {
+	tx.writes[key] = val
+}
+
+func (tx *Txn) Commit(ctx context.Context) error {
+	tx.s.mu.Lock()
+	defer tx.s.mu.Unlock()
+
+	for k := range tx.writes {
+		vs := tx.s.versions[k]
+		if len(vs) > 0 && vs[0].TS > tx.startTS {
+			return errors.New("write-write conflict - key updated after txn start")
+		}
+	}
+
+	commitTS := tx.s.commitIndex + 1
+	for k, v := range tx.writes {
+		tx.s.state[k] = v
+		tx.s.versions[k] = append([]Version{{TS: commitTS, Value: v}}, tx.s.versions[k]...)
+		tx.s.log = append(tx.s.log, Entry{Key: k, Value: v})
+	}
+
+	tx.s.commitIndex++
+	tx.s.signalAppliedLocked()
+	return nil
 }
 
 func New() *Store {
 	s := &Store{
 		state:       make(map[string]string),
 		commitIndex: 0,
+		versions:    make(map[string][]Version),
 	}
 	s.readCond = sync.NewCond(&s.mu)
+	s.appliedCh = make(chan struct{})
 	return s
+}
+
+func (s *Store) signalAppliedLocked() {
+	close(s.appliedCh)
+	s.appliedCh = make(chan struct{})
 }
 
 func (s *Store) AppendPutPending(key, value string) int {
@@ -45,7 +105,13 @@ func (s *Store) CommitNext() error {
 	}
 	e := s.log[s.commitIndex]
 	s.state[e.Key] = e.Value
+
+	// append a commited version
+	commitTS := s.commitIndex + 1
+	s.versions[e.Key] = append([]Version{{TS: commitTS, Value: e.Value}}, s.versions[e.Key]...)
+
 	s.commitIndex++
+	s.signalAppliedLocked()
 	s.readCond.Broadcast()
 	return nil
 }
@@ -70,29 +136,32 @@ func (s *Store) ReadFence() int {
 
 func (s *Store) WaitAppliedAtLeast(ctx context.Context, target int) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	for s.commitIndex < target {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		done := make(chan struct{})
-		go func() {
-			s.readCond.Wait()
-			close(done)
-		}()
+		ch := s.appliedCh
+		s.mu.Unlock()
+
 		select {
-		case <-done:
-			// woke up by Broadcast or spurious wake; loop continues
 		case <-ctx.Done():
-			// Wake the waiter goroutine by broadcasting and return.
-			s.readCond.Broadcast()
 			return ctx.Err()
-		case <-time.After(50 * time.Millisecond):
-			// Periodic wake to re-check ctx (defensive).
+		case <-ch:
+			// awoke because someone commited and channel was closed
+		}
+		s.mu.Lock()
+	}
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *Store) GetAt(key string, readTS Timestamp) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, v := range s.versions[key] {
+		if v.TS <= readTS {
+			return v.Value, true
 		}
 	}
-	return nil
+	return "", false
 }
 
 func (s *Store) GetLinearizable(ctx context.Context, key string) (string, bool, error) {

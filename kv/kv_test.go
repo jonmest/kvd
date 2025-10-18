@@ -84,3 +84,79 @@ func TestLinearizableReadUsesBarrier(t *testing.T) {
 		t.Fatalf("linearizable read failed: v=%q ok=%v err=%v", v, ok, err)
 	}
 }
+
+func TestStaleVsLinearizableRead(t *testing.T) {
+	s := New()
+	s.AppendPut("k", "v1")
+	s.AppendPutPending("k", "v2")
+
+	// Sanity: stale-ok read sees old value before commit.
+	if v, _ := s.Get("k"); v != "v1" {
+		t.Fatalf("stale read should see old value before commit, got %q", v)
+	}
+
+	// 1) Linearizable read started BEFORE commit must NOT see v2.
+	{
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		v, ok, err := s.GetLinearizable(ctx, "k")
+		if err != nil || !ok {
+			t.Fatalf("linearizable read failed. ok=%v, err=%v", ok, err)
+		}
+		if v != "v1" {
+			t.Fatalf("linearizable read should not see uncommitted write; got %q", v)
+		}
+	}
+
+	// Commit v2.
+	if err := s.CommitNext(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2) Linearizable read started AFTER commit must see v2.
+	{
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		v, ok, err := s.GetLinearizable(ctx, "k")
+		if err != nil || !ok || v != "v2" {
+			t.Fatalf("after commit, linearizable read should see v2; got %q (ok=%v, err=%v)", v, ok, err)
+		}
+	}
+}
+
+func TestMVCCSnapshotRead(t *testing.T) {
+	s := New()
+	s.AppendPut("a", "v1")        // commit ts = 1
+	s.AppendPutPending("a", "v2") // not committed yet
+	require := func(ts Timestamp, want string) {
+		if got, ok := s.GetAt("a", ts); !ok || got != want {
+			t.Fatalf("GetAt(ts=%d): want %q, got %q (ok=%v)", ts, want, got, ok)
+		}
+	}
+	require(1, "v1")
+
+	// Commit v2 at ts=2
+	if err := s.CommitNext(); err != nil {
+		t.Fatal(err)
+	}
+	require(1, "v1")
+	require(2, "v2")
+}
+
+func TestTxnOCCConflict(t *testing.T) {
+	s := New()
+	s.AppendPut("a", "v1") // ts=1
+
+	tx := s.Begin() // startTS=1 (because commitIndex=1 right now)
+	tx.Put("a", "v2")
+
+	// Another writer commits "a"=v3 first (ts=2)
+	s.AppendPut("a", "v3")
+
+	// Now our txn must fail: a newer version exists (ts=2 > startTS=1)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := tx.Commit(ctx); err == nil {
+		t.Fatal("expected OCC conflict, got nil")
+	}
+}
