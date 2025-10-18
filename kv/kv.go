@@ -4,9 +4,8 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 )
-
-type Timestamp = int
 
 type Version struct {
 	TS    Timestamp
@@ -27,6 +26,8 @@ type Store struct {
 	readCond  *sync.Cond
 	appliedCh chan struct{}
 	versions  map[string][]Version
+
+	clock *Clock
 }
 
 type Txn struct {
@@ -37,7 +38,7 @@ type Txn struct {
 
 func (s *Store) Begin() *Txn {
 	s.mu.Lock()
-	start := s.commitIndex
+	start := s.clock.Now()
 	s.mu.Unlock()
 
 	return &Txn{
@@ -56,13 +57,13 @@ func (tx *Txn) Commit(ctx context.Context) error {
 	defer tx.s.mu.Unlock()
 
 	for k := range tx.writes {
-		vs := tx.s.versions[k]
-		if len(vs) > 0 && vs[0].TS > tx.startTS {
+		if vs := tx.s.versions[k]; len(vs) > 0 && vs[0].TS > tx.startTS {
 			return errors.New("write-write conflict - key updated after txn start")
 		}
 	}
 
-	commitTS := tx.s.commitIndex + 1
+	commitTS := tx.s.clock.Now()
+
 	for k, v := range tx.writes {
 		tx.s.state[k] = v
 		tx.s.versions[k] = append([]Version{{TS: commitTS, Value: v}}, tx.s.versions[k]...)
@@ -79,6 +80,7 @@ func New() *Store {
 		state:       make(map[string]string),
 		commitIndex: 0,
 		versions:    make(map[string][]Version),
+		clock:       NewClock(100 * time.Millisecond),
 	}
 	s.readCond = sync.NewCond(&s.mu)
 	s.appliedCh = make(chan struct{})
@@ -107,7 +109,7 @@ func (s *Store) CommitNext() error {
 	s.state[e.Key] = e.Value
 
 	// append a commited version
-	commitTS := s.commitIndex + 1
+	commitTS := s.clock.Now()
 	s.versions[e.Key] = append([]Version{{TS: commitTS, Value: e.Value}}, s.versions[e.Key]...)
 
 	s.commitIndex++

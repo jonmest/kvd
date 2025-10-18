@@ -160,3 +160,24 @@ func TestTxnOCCConflict(t *testing.T) {
 		t.Fatal("expected OCC conflict, got nil")
 	}
 }
+
+func TestHLCMonotonic(t *testing.T) {
+	c := NewClock(50 * time.Millisecond)
+	t1 := c.Now()
+	time.Sleep(5 * time.Millisecond)
+	t2 := c.Now()
+	if t2.WallMillis() < t1.WallMillis() {
+		t.Fatalf("time went backwards: %v -> %v", t1, t2)
+	}
+}
+
+func TestCommitWait(t *testing.T) {
+	c := NewClock(20 * time.Millisecond)
+	start := time.Now()
+	ts := c.Now()
+	c.CommitWait(ts)
+	elapsed := time.Since(start)
+	if elapsed < 40*time.Millisecond {
+		t.Fatalf("commit-wait too short: %v", elapsed)
+	}
+}
