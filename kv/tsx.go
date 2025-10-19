@@ -1,7 +1,6 @@
 package kv
 
 import (
-	"context"
 	"errors"
 )
 
@@ -15,7 +14,7 @@ func (tx *Txn) Put(key, val string) {
 	tx.writes[key] = val
 }
 
-func (tx *Txn) Commit(ctx context.Context) error {
+func (tx *Txn) Commit(ctx Context) error {
 	tx.s.mu.Lock()
 	defer tx.s.mu.Unlock()
 

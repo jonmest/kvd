@@ -1,7 +1,6 @@
 package kv
 
 import (
-	"context"
 	"errors"
 	"sync"
 	"time"
@@ -103,7 +102,7 @@ func (s *Store) ReadFence() int {
 	return s.commitIndex
 }
 
-func (s *Store) WaitAppliedAtLeast(ctx context.Context, target int) error {
+func (s *Store) WaitAppliedAtLeast(ctx Context, target int) error {
 	s.mu.Lock()
 
 	for s.commitIndex < target {
@@ -133,7 +132,7 @@ func (s *Store) GetAt(key string, readTS Timestamp) (string, bool) {
 	return "", false
 }
 
-func (s *Store) GetLinearizable(ctx context.Context, key string) (string, bool, error) {
+func (s *Store) GetLinearizable(ctx Context, key string) (string, bool, error) {
 	fence := s.ReadFence()
 	if err := s.WaitAppliedAtLeast(ctx, fence); err != nil {
 		return "", false, err
