@@ -126,21 +126,32 @@ func TestStaleVsLinearizableRead(t *testing.T) {
 
 func TestMVCCSnapshotRead(t *testing.T) {
 	s := New()
-	s.AppendPut("a", "v1")        // commit ts = 1
-	s.AppendPutPending("a", "v2") // not committed yet
+
+	// Commit v1
+	s.AppendPut("a", "v1")        // committed
+	s.AppendPutPending("a", "v2") // staged but NOT committed yet
+
+	// Take a snapshot timestamp after v1 is committed (and before v2 is committed)
+	tsAfterV1 := s.clock.Now() // ok here because tests are in package kv
+
 	require := func(ts Timestamp, want string) {
 		if got, ok := s.GetAt("a", ts); !ok || got != want {
 			t.Fatalf("GetAt(ts=%d): want %q, got %q (ok=%v)", ts, want, got, ok)
 		}
 	}
-	require(1, "v1")
 
-	// Commit v2 at ts=2
+	// Snapshot after v1 should see v1
+	require(tsAfterV1, "v1")
+
+	// Now commit v2
 	if err := s.CommitNext(); err != nil {
 		t.Fatal(err)
 	}
-	require(1, "v1")
-	require(2, "v2")
+
+	// A timestamp from "now" should see v2 (the latest)
+	tsAfterV2 := s.clock.Now()
+	require(tsAfterV1, "v1") // still v1 when reading at the old snapshot
+	require(tsAfterV2, "v2") // latest snapshot sees v2
 }
 
 func TestTxnOCCConflict(t *testing.T) {
@@ -173,11 +184,16 @@ func TestHLCMonotonic(t *testing.T) {
 
 func TestCommitWait(t *testing.T) {
 	c := NewClock(20 * time.Millisecond)
-	start := time.Now()
 	ts := c.Now()
+	epsilon := 2 * c.MaxOffset
+
+	// Precompute the target wall time we must not return before
+	target := time.UnixMilli(ts.WallMillis()).Add(epsilon)
+
 	c.CommitWait(ts)
-	elapsed := time.Since(start)
-	if elapsed < 40*time.Millisecond {
-		t.Fatalf("commit-wait too short: %v", elapsed)
+
+	// Assert the actual postcondition, not a wall-clock duration from an arbitrary start
+	if time.Now().Before(target) {
+		t.Fatalf("CommitWait returned too early: now=%v target=%v", time.Now(), target)
 	}
 }
